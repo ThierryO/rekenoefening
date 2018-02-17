@@ -24,18 +24,21 @@ start_data <- function() {
       group_by(som, vraag) %>%
       summarise(
         goed = sum(correct),
-        fout = sum(!correct)
+        fout = sum(!correct),
+        duur = sum(duur)
       ) %>%
       left_join(x = basis, by = c("som", "vraag")) %>%
       mutate(
         goed = pmax(goed, 0, na.rm = TRUE),
-        fout = pmax(fout, 0, na.rm = TRUE)
+        fout = pmax(fout, 0, na.rm = TRUE),
+        duur = pmax(duur, 0, na.rm = TRUE)
       ) -> z
   } else {
     basis %>%
-      mutate(goed = 0, fout = 0) -> z
+      mutate(goed = 0, fout = 0, duur = 0) -> z
   }
-  return(z)
+  z %>%
+    mutate(kans = (duur + 30) * (fout + 1) * (fout + goed + 1) ^ -1.5)
 }
 
 ui <- fluidPage(
@@ -80,7 +83,7 @@ server <- function(session, input, output) {
       i <- sample(
         seq_along(data$combinaties$som),
         size = 1,
-        prob = (data$combinaties$fout + 1) / (data$combinaties$goed + data$combinaties$fout + 1)
+        prob = data$combinaties$kans
       )
       data$som <- data$combinaties$som[i]
       data$vraag <- data$combinaties$vraag[i]
@@ -159,6 +162,8 @@ server <- function(session, input, output) {
         )
         data$combinaties$fout[i] <- data$combinaties$fout[i] + 1
       }
+      data$combinaties <- data$combinaties %>%
+        mutate(kans = (duur + 30) * (fout + 1) * (fout + goed + 1) ^ -1.5)
     }
   )
 
