@@ -6,47 +6,94 @@ if (!require(dplyr)) {
   install.packages("dplyr")
   library(dplyr)
 }
+if (!require(tidyr)) {
+  install.packages("tidyr")
+  library(tidyr)
+}
+if (!require(INLA)) {
+  install.packages(
+    "INLA",
+    repos = c(
+      getOption("repos"), INLA = "https://inla.r-inla-download.org/R/stable"
+    ),
+    dependencies = TRUE
+  )
+  library(INLA)
+}
 
 start_data <- function() {
   expand.grid(
     x = 0:10,
-    y = 0:10,
+    b = 0:10,
     operator = c("\u00d7", "\u00f7"),
     stringsAsFactors = FALSE
   ) %>%
-    filter(y > 0 | operator == "\u00d7") %>%
+    filter(b > 0 | operator == "\u00d7") %>%
     mutate(
-      product = x * y,
-      vraag = ifelse(operator == "\u00d7", x, product),
-      antwoord = ifelse(operator == "\u00d7", product, x)
-    ) %>%
-    select(a = vraag, operator, b = y, antwoord) -> combinaties
+      a = ifelse(operator == "\u00d7", x, x * b),
+      antwoord = ifelse(operator == "\u00d7", x * b, x),
+      kans = 100
+    ) -> default
   if (!file.exists("maaltafels.txt")) {
-    combinaties %>%
-      mutate(duur = 0, goed = 0, fout = 0) -> combinaties
-  } else {
-    read.table(
-      "maaltafels.txt", header = TRUE, stringsAsFactors = FALSE, sep = "\t"
-    ) %>%
-      group_by(a, operator, b) %>%
-      summarise(
-        duur = mean(duur),
-        goed = sum(correct),
-        fout = sum(correct == 0)
-      ) %>%
-      ungroup() %>%
-      left_join(x = combinaties, by = c("a", "operator", "b")) %>%
-      mutate(
-        duur = pmax(duur, 0, na.rm = TRUE),
-        goed = pmax(goed, 0, na.rm = TRUE),
-        fout = pmax(fout, 0, na.rm = TRUE)
-      ) -> combinaties
+    default <- select(default, -x)
+    return(default)
   }
-  combinaties %>%
+  read.delim("maaltafels.txt", stringsAsFactors = FALSE) %>%
     mutate(
-      kans = (duur + 30) * (fout + 1) * (fout + goed + 1) ^ -1.5
-    ) -> combinaties
-  return(combinaties)
+      x = ifelse(operator == "\u00d7", a, a / b),
+      duur = ifelse(correct == 0, 100, 1) * duur
+    ) %>%
+    filter(b > 0 | operator == "\u00d7") %>%
+    filter(x %in% b) %>%
+    filter(b %in% x) %>%
+    filter(x %in% b) -> combinaties
+  if (length(unique(combinaties$operator)) < 2) {
+    return(default)
+  }
+  if (length(unique(combinaties$x)) < 2) {
+    return(default)
+  }
+  m <- inla(
+    duur ~ operator + f(x, model = "iid") + f(b, copy = "x"),
+    family = "gamma",
+    data = combinaties,
+    control.predictor = list(link = 1),
+    control.compute = list(config = TRUE)
+  )
+  combinaties %>%
+    select(x, operator, b) %>%
+    mutate(
+      ucl = m$summary.fitted.values[, "0.975quant"]
+    ) %>%
+    left_join(x = default, by = c("x", "b", "operator")) %>%
+    mutate(
+      kans = ifelse(is.na(ucl), 10 * max(ucl, na.rm = TRUE), ucl)
+    ) %>%
+    select(-ucl) -> default
+  m$summary.random$x %>%
+    transmute(tafel = ID, mean, var = sd ^ 2) -> rf
+  attr(default, "plot") <- expand.grid(
+    tafel = rf$tafel,
+    operator = c("\u00d7", "\u00f7")
+  ) %>%
+    inner_join(rf, by = "tafel") %>%
+    mutate(
+      mean = mean + m$summary.fixed[1, "mean"],
+      var = var + m$summary.fixed[1, "sd"] ^ 2,
+      mean = mean + ifelse(operator == "\u00d7", m$summary.fixed[1, "mean"], 0),
+      var = var + ifelse(operator == "\u00d7", m$summary.fixed[1, "sd"] ^ 2, 0),
+      lcl = exp(qnorm(0.025, mean, sqrt(var))),
+      ucl = exp(qnorm(0.975, mean, sqrt(var))),
+      mean = exp(mean)
+    ) %>%
+    ggplot(
+      aes(x = tafel, y = mean, ymin = lcl, ymax = ucl, colour = operator)
+    ) +
+    geom_errorbar() +
+    geom_point() +
+    scale_x_continuous(breaks = 0:10) +
+    ylab("moeilijkheidsgraad")
+  return(default)
 }
 
 ui <- fluidPage(
@@ -69,40 +116,16 @@ ui <- fluidPage(
     column(2, numericInput("antwoord", value = NA, label = "", width = "100px"))
   ),
   htmlOutput("vorige"),
-  htmlOutput("score")
+  htmlOutput("score"),
+  plotOutput("moeilijkheidsgraad")
 )
 
 server <- function(session, input, output) {
   data <- reactiveValues(
     combinaties = start_data(),
-    ok = 0,
-    score = 0
-  )
-
-  observeEvent(
-    data$combinaties,
-    {
-      i <- sample(
-        nrow(data$combinaties),
-        size = 1,
-        prob = data$combinaties$kans
-      )
-      data$a <- data$combinaties$a[i]
-      data$operator <- data$combinaties$operator[i]
-      data$b <- data$combinaties$b[i]
-      data$antwoord <- data$combinaties$antwoord[i]
-      output$a <- renderText(
-        sprintf('<h1 align="center">%i</h1>', data$a)
-      )
-      output$operator <- renderText(
-        sprintf('<h1 align="center">%s</h1>', data$operator)
-      )
-      output$b <- renderText(
-        sprintf('<h1 align="center">%i</h1>', data$b)
-      )
-      updateNumericInput(session, "antwoord", value = NA)
-      data$timestamp <- Sys.time()
-    }
+    ok = 1,
+    score = 0,
+    a = NULL
   )
 
   observeEvent(
@@ -115,8 +138,43 @@ server <- function(session, input, output) {
   )
 
   observeEvent(
+    data$combinaties,
+    {
+      if (!"plot" %in% names(attributes(data$combinaties))) {
+        return(NULL)
+      }
+      output$moeilijkheidsgraad <- renderPlot(
+        attr(data$combinaties, "plot")
+      )
+    }
+  )
+
+  observeEvent(
     data$ok,
     {
+      if (is.null(data$a)) {
+        i <- sample(
+          nrow(data$combinaties),
+          size = 1,
+          prob = data$combinaties$kans
+        )
+        data$a <- data$combinaties$a[i]
+        data$operator <- data$combinaties$operator[i]
+        data$b <- data$combinaties$b[i]
+        data$antwoord <- data$combinaties$antwoord[i]
+        output$a <- renderText(
+          sprintf('<h1 align="center">%i</h1>', data$a)
+        )
+        output$operator <- renderText(
+          sprintf('<h1 align="center">%s</h1>', data$operator)
+        )
+        output$b <- renderText(
+          sprintf('<h1 align="center">%i</h1>', data$b)
+        )
+        updateNumericInput(session, "antwoord", value = NA)
+        data$timestamp <- Sys.time()
+        return(NULL)
+      }
       if (is.na(input$antwoord)) {
         return(NULL)
       }
@@ -154,7 +212,6 @@ server <- function(session, input, output) {
             antwoord
           )
         )
-        data$combinaties$goed[z]  <- data$combinaties$goed[z] + 1
         data$score <- data$score + 1
       } else {
         output$vorige <- renderText(
@@ -166,10 +223,32 @@ server <- function(session, input, output) {
             antwoord
           )
         )
-        data$combinaties$fout[z] <- data$combinaties$fout[z] + 1
         data$score <- data$score - 2
       }
       output$score <- renderText(sprintf("<h1>Score: %i</h1>", data$score))
+      if (data$ok %% 10 == 0) {
+        data$combinaties <- start_data()
+      }
+      i <- sample(
+        nrow(data$combinaties),
+        size = 1,
+        prob = data$combinaties$kans
+      )
+      data$a <- data$combinaties$a[i]
+      data$operator <- data$combinaties$operator[i]
+      data$b <- data$combinaties$b[i]
+      data$antwoord <- data$combinaties$antwoord[i]
+      output$a <- renderText(
+        sprintf('<h1 align="center">%i</h1>', data$a)
+      )
+      output$operator <- renderText(
+        sprintf('<h1 align="center">%s</h1>', data$operator)
+      )
+      output$b <- renderText(
+        sprintf('<h1 align="center">%i</h1>', data$b)
+      )
+      updateNumericInput(session, "antwoord", value = NA)
+      data$timestamp <- Sys.time()
     }
   )
 
